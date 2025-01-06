@@ -7,7 +7,7 @@ struct A {
   public:
     A(int c=0):a(c)
     {
-        cout<<"A::A:"<<a<<endl;
+        cout<<"A::A::"<<a<<endl;
     }
     void f()
     {
