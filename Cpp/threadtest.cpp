@@ -44,18 +44,6 @@ void thread_function(std::tuple<int, std::string> t) {
     coutsln()("ID1: " + std::to_string(std::get<0>(t)));
     coutsln()("Name1: " + std::get<1>(t));
 }
-/*
-auto vec = std::views::iota(1, 5)
-             | std::views::transform([](int v){ return v * 2; })
-             | std::ranges::to<std::vector>();
- 
-    static_assert(std::same_as<decltype(vec), std::vector<int>>);
-    std::println("{}", vec);
- 
-    auto list = vec | std::views::take(3) | std::ranges::to<std::list<double>>();
-    std::println("{}", list);
-*/
-
 
 void thread_function2(std::vector<double> t2) {
     std::cout << "Thread is running" << std::endl;
