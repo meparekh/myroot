@@ -9,6 +9,12 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QIcon
 from scanner import DuplicateScanner
 from database import HistoryManager
+from consolidator import MediaConsolidator
+from ai_organizer import AIOrganizer, NUDENET_AVAILABLE, FACE_RECOGNITION_AVAILABLE
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                             QPushButton, QFileDialog, QTreeWidget, QTreeWidgetItem, 
+                             QProgressBar, QLabel, QMessageBox, QTabWidget, QHeaderView,
+                             QSplitter, QListWidget, QListWidgetItem, QTextEdit, QLineEdit)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -24,6 +30,120 @@ class ScanThread(QThread):
     def run(self):
         duplicates = self.scanner.scan_directory(self.path, self.progress_update.emit)
         self.scan_complete.emit(duplicates)
+
+class ConsolidationThread(QThread):
+    log_message = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, drive_path, mode="consolidate"):
+        super().__init__()
+        self.drive_path = drive_path
+        self.mode = mode
+        self.consolidator = MediaConsolidator()
+
+    def run(self):
+        if self.mode == "consolidate":
+            self.consolidator.consolidate_drive(self.drive_path, log_callback=self.log_message.emit)
+        elif self.mode == "organize":
+            self.consolidator.organize_folder(self.drive_path, log_callback=self.log_message.emit)
+        self.finished.emit()
+
+class AIThread(QThread):
+    log_message = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, target_folder, mode="nsfw"):
+        super().__init__()
+        self.target_folder = target_folder
+        self.mode = mode
+        self.organizer = AIOrganizer()
+
+    def run(self):
+        if self.mode == "nsfw":
+            self.run_nsfw_scan()
+        elif self.mode == "face":
+            self.run_face_grouping()
+        self.finished.emit()
+
+    def run_nsfw_scan(self):
+        self.log_message.emit(f"Starting NSFW scan in {self.target_folder}...")
+        restricted_dir = os.path.join(self.target_folder, "Restricted")
+        if not os.path.exists(restricted_dir):
+            os.makedirs(restricted_dir)
+
+        count = 0
+        for root, _, files in os.walk(self.target_folder):
+            if "Restricted" in root:
+                continue
+            for file in files:
+                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.mp4', '.avi', '.mov')):
+                    path = os.path.join(root, file)
+                    try:
+                        if self.organizer.is_nsfw(path):
+                            # Handle filename collisions
+                            unique_filename = self.organizer.get_unique_filename(restricted_dir, file)
+                            dest_path = os.path.join(restricted_dir, unique_filename)
+                            shutil.move(path, dest_path)
+                            self.log_message.emit(f"Moved NSFW content: {file}")
+                            count += 1
+                    except Exception as e:
+                        self.log_message.emit(f"Error checking {file}: {e}")
+        
+        self.log_message.emit(f"NSFW Scan complete. Moved {count} files.")
+
+
+    def run_face_grouping(self):
+        self.log_message.emit(f"Scanning faces in {self.target_folder}...")
+        
+        # Scan for faces and separate family photos
+        face_data, family_photos = self.organizer.scan_faces(self.target_folder)
+        self.log_message.emit(f"Found {len(family_photos)} family photos (>3 faces)")
+        self.log_message.emit(f"Found faces in {len(face_data)} other images. Grouping...")
+        
+        # Move family photos first
+        if family_photos:
+            family_dir = os.path.join(self.target_folder, "Family_Friends")
+            if not os.path.exists(family_dir):
+                os.makedirs(family_dir)
+            
+            for path in family_photos:
+                try:
+                    if os.path.exists(path):
+                        filename = self.organizer.get_unique_filename(family_dir, os.path.basename(path))
+                        shutil.move(path, os.path.join(family_dir, filename))
+                except Exception as e:
+                    self.log_message.emit(f"Error moving {path}: {e}")
+            
+            self.log_message.emit(f"Moved {len(family_photos)} photos to Family_Friends")
+        
+        # Group remaining faces by person
+        groups = self.organizer.group_faces(face_data)
+        self.log_message.emit(f"Identified {len(groups)} distinct person groups")
+        
+        moved_count = 0
+        
+        for label, paths in groups.items():
+            # Only create folder if person appears in >10 photos
+            if len(paths) > 10:
+                person_dir = os.path.join(self.target_folder, f"Person_{label}")
+                if not os.path.exists(person_dir):
+                    os.makedirs(person_dir)
+                
+                for path in paths:
+                    try:
+                        if os.path.exists(path):  # Check if not already moved
+                            filename = self.organizer.get_unique_filename(person_dir, os.path.basename(path))
+                            shutil.move(path, os.path.join(person_dir, filename))
+                            moved_count += 1
+                    except Exception as e:
+                        self.log_message.emit(f"Error moving {path}: {e}")
+                
+                self.log_message.emit(f"Created Person_{label} with {len(paths)} photos")
+            else:
+                # Person has <=10 photos, keep in main folder
+                self.log_message.emit(f"Person_{label} has only {len(paths)} photos, keeping in main folder")
+        
+        self.log_message.emit(f"Face grouping complete. Organized {moved_count} photos into person folders.")
 
 class DuplicateFinderUI(QMainWindow):
     def __init__(self):
@@ -54,6 +174,21 @@ class DuplicateFinderUI(QMainWindow):
         self.history_tab = QWidget()
         self.init_history_tab()
         self.tabs.addTab(self.history_tab, "History")
+
+        # Tab 3: Consolidate
+        self.consolidate_tab = QWidget()
+        self.init_consolidate_tab()
+        self.tabs.addTab(self.consolidate_tab, "Consolidate")
+        
+        # Tab 4: Organize
+        self.organize_tab = QWidget()
+        self.init_organize_tab()
+        self.tabs.addTab(self.organize_tab, "Organize")
+        
+        # Tab 5: AI Organize
+        self.ai_tab = QWidget()
+        self.init_ai_tab()
+        self.tabs.addTab(self.ai_tab, "AI Organize")
         
         self.tabs.currentChanged.connect(self.on_tab_change)
 
@@ -126,6 +261,193 @@ class DuplicateFinderUI(QMainWindow):
         refresh_btn = QPushButton("Refresh History")
         refresh_btn.clicked.connect(self.load_history)
         layout.addWidget(refresh_btn)
+
+    def init_consolidate_tab(self):
+        layout = QVBoxLayout(self.consolidate_tab)
+        
+        info_label = QLabel("Step 1: Consolidate photos and videos from D: drive to D:\\ConsolidatedMedia.\n"
+                            "Files will be grouped by their parent folder name.\n"
+                            "System folders are excluded. Junk files (._*) will be removed.")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        self.consolidate_btn = QPushButton("Start Consolidation (D: Drive)")
+        self.consolidate_btn.clicked.connect(self.start_consolidation)
+        layout.addWidget(self.consolidate_btn)
+
+        self.consolidate_log = QTextEdit()
+        self.consolidate_log.setReadOnly(True)
+        layout.addWidget(self.consolidate_log)
+
+    def init_organize_tab(self):
+        layout = QVBoxLayout(self.organize_tab)
+        
+        info_label = QLabel("Step 2: Organize and flatten a folder into 'Photos' and 'Videos'.\n"
+                            "WARNING: This will remove original subfolders and flatten the structure.")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # Folder selection
+        folder_layout = QHBoxLayout()
+        self.org_folder_input = QLineEdit("D:\\ConsolidatedMedia")
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self.browse_organize_folder)
+        folder_layout.addWidget(self.org_folder_input)
+        folder_layout.addWidget(browse_btn)
+        layout.addLayout(folder_layout)
+        
+        self.organize_btn = QPushButton("Start Organization")
+        self.organize_btn.clicked.connect(self.start_organization)
+        layout.addWidget(self.organize_btn)
+        
+        self.organize_log = QTextEdit()
+        self.organize_log.setReadOnly(True)
+        layout.addWidget(self.organize_log)
+
+    def init_ai_tab(self):
+        layout = QVBoxLayout(self.ai_tab)
+        
+        info_label = QLabel("Phase 2: AI-Powered Organization\n"
+                            "Note: Processing happens locally. Large models may be downloaded on first run.")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # NSFW Section
+        nsfw_group = QWidget()
+        nsfw_layout = QVBoxLayout(nsfw_group)
+        nsfw_label = QLabel("<b>1. NSFW Filter</b>: Move explicit content to 'Restricted' folder.")
+        self.nsfw_btn = QPushButton("Start NSFW Scan")
+        self.nsfw_btn.clicked.connect(self.start_nsfw_scan)
+        
+        if not NUDENET_AVAILABLE:
+            self.nsfw_btn.setEnabled(False)
+            self.nsfw_btn.setText("Start NSFW Scan (NudeNet not installed)")
+            
+        nsfw_layout.addWidget(nsfw_label)
+        nsfw_layout.addWidget(self.nsfw_btn)
+        layout.addWidget(nsfw_group)
+        
+        # Face Grouping Section
+        face_group = QWidget()
+        face_layout = QVBoxLayout(face_group)
+        face_label = QLabel("<b>2. Face Grouping</b>: Group photos by person (>10 photos) and Family (>3 faces).")
+        self.face_btn = QPushButton("Start Face Grouping")
+        self.face_btn.clicked.connect(self.start_face_grouping)
+        
+        if not FACE_RECOGNITION_AVAILABLE:
+            self.face_btn.setEnabled(False)
+            self.face_btn.setText("Start Face Grouping (face_recognition not installed)")
+            
+        face_layout.addWidget(face_label)
+        face_layout.addWidget(self.face_btn)
+        layout.addWidget(face_group)
+        
+        self.ai_log = QTextEdit()
+        self.ai_log.setReadOnly(True)
+        layout.addWidget(self.ai_log)
+
+    def start_nsfw_scan(self):
+        target_folder = self.org_folder_input.text()
+        if not os.path.exists(target_folder):
+            QMessageBox.warning(self, "Error", "Target folder does not exist.")
+            return
+
+        self.nsfw_btn.setEnabled(False)
+        self.ai_log.clear()
+        self.ai_log.append("Starting NSFW Scan...")
+        
+        self.ai_thread = AIThread(target_folder, mode="nsfw")
+        self.ai_thread.log_message.connect(self.update_ai_log)
+        self.ai_thread.finished.connect(self.ai_finished)
+        self.ai_thread.start()
+
+    def start_face_grouping(self):
+        target_folder = self.org_folder_input.text()
+        if not os.path.exists(target_folder):
+            QMessageBox.warning(self, "Error", "Target folder does not exist.")
+            return
+
+        self.face_btn.setEnabled(False)
+        self.ai_log.clear()
+        self.ai_log.append("Starting Face Grouping...")
+        
+        self.ai_thread = AIThread(target_folder, mode="face")
+        self.ai_thread.log_message.connect(self.update_ai_log)
+        self.ai_thread.finished.connect(self.ai_finished)
+        self.ai_thread.start()
+
+    def update_ai_log(self, message):
+        self.ai_log.append(message)
+
+    def ai_finished(self):
+        self.nsfw_btn.setEnabled(True)
+        self.face_btn.setEnabled(True)
+        QMessageBox.information(self, "AI Task Complete", "Processing finished.")
+
+    def browse_organize_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder to Organize", self.org_folder_input.text())
+        if folder:
+            self.org_folder_input.setText(folder)
+
+    def start_organization(self):
+        target_folder = self.org_folder_input.text()
+        if not os.path.exists(target_folder):
+            QMessageBox.warning(self, "Error", "Target folder does not exist.")
+            return
+
+        reply = QMessageBox.question(self, 'Confirm Organization', 
+                                     f"This will FLATTEN files in {target_folder} into Photos/Videos.\n"
+                                     "Original subfolders will be removed.\n"
+                                     "Are you sure?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+                                     QMessageBox.StandardButton.No)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self.organize_btn.setEnabled(False)
+            self.organize_log.clear()
+            self.organize_log.append("Starting organization...")
+            
+            # Reuse thread class but with mode
+            self.organize_thread = ConsolidationThread(target_folder, mode="organize")
+            self.organize_thread.log_message.connect(self.update_organize_log)
+            self.organize_thread.finished.connect(self.organization_finished)
+            self.organize_thread.start()
+
+    def update_organize_log(self, message):
+        self.organize_log.append(message)
+
+    def organization_finished(self):
+        self.organize_btn.setEnabled(True)
+        QMessageBox.information(self, "Organization Complete", "File organization finished.")
+
+    def start_consolidation(self):
+        reply = QMessageBox.question(self, "Confirm Consolidation", 
+                                     "This will MOVE files on your D: drive. Are you sure?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.consolidate_btn.setEnabled(False)
+            self.consolidate_log.clear()
+            self.consolidate_log.append("Starting consolidation...")
+            
+            # Hardcoded to D: as per request
+            drive_path = "D:\\"
+            if not os.path.exists(drive_path):
+                 self.consolidate_log.append("Error: D: drive not found.")
+                 self.consolidate_btn.setEnabled(True)
+                 return
+
+            self.cons_thread = ConsolidationThread(drive_path)
+            self.cons_thread.log_message.connect(self.update_consolidation_log)
+            self.cons_thread.finished.connect(self.on_consolidation_finished)
+            self.cons_thread.start()
+
+    def update_consolidation_log(self, message):
+        self.consolidate_log.append(message)
+
+    def on_consolidation_finished(self):
+        self.consolidate_btn.setEnabled(True)
+        QMessageBox.information(self, "Consolidation Complete", "Media consolidation finished.")
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Directory")
